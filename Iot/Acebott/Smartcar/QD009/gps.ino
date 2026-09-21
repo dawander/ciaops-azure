@@ -1,6 +1,17 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include <string.h>
 #include <TinyGPS++.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <math.h>
+#include <esp_system.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <WiFi.h>
+#include <Adafruit_MQTT.h>
+#include <Adafruit_MQTT_Client.h>
+#include "telemetry_secrets.h"  // WIFI_SSID/PASSWORD + AIO_* - gitignored, not committed
 /**
  * ACEBOTT ESP32-Max-V1.0 - Normal (Differential / Skid-Steer) Wheels
  * Improved GPS-only "drive North" test
@@ -16,6 +27,7 @@
  *  - LEFT_LED_PIN  (4)  : External left LED
  *  - RIGHT_LED_PIN (33) : External right LED
  *  - GPS_RX_PIN (27) : QD009 GPS TX -> ESP32 RX
+ *  - SSD1306 OLED I2C (SDA=21, SCL=22). VCC = 3.3V only, not 5V.
  *
  * Shift Register Bit Mapping:
  *  - M1 (Left Front)  : Forward = 128 (0x80), Backward = 64 (0x40)
@@ -43,12 +55,22 @@
 #define GPS_RX_PIN     27
 #define GPS_TX_PIN     -1
 #define GPS_BAUD       9600
+#define OLED_SDA_PIN   21   // Acebott car-shield I2C header SDA (ESP32 GPIO 21)
+#define OLED_SCL_PIN   22   // Acebott car-shield I2C header SCL (ESP32 GPIO 22)
+#define OLED_ADDR      0x3C // Core Electronics white SSD1306 default
+#define OLED_WIDTH     128
+#define OLED_HEIGHT    64
+#define OLED_RESET     -1
+#define LCD_REFRESH_MS 400
 // ===================== GPS NORTH TEST TUNING =====================
-#define GPS_NORTH_DRIVE_MS        5500    // drive longer for clearer lat change
-#define GPS_NORTH_TURN_MS         700     // in-place spin needs time once wheels actually roll
-#define GPS_NORTH_SETTLE_MS       2800    // give GPS time to update after stop
+#define GPS_NORTH_DRIVE_MS        7000    // longer burst so COG/displacement can form
+#define GPS_NORTH_TURN_MS         700     // fallback; actual spin is scaled by heading error
+#define GPS_NORTH_TURN_MS_PER_DEG 14      // ~2.5 s for a 180° correction
+#define GPS_NORTH_TURN_MIN_MS     600
+#define GPS_NORTH_TURN_MAX_MS     3200
+#define GPS_NORTH_SETTLE_MS       400     // only a short pause; heading is sampled while moving
 #define GPS_NORTH_FIX_HOLD_MS     2500    // require a continuous fix before the first move
-#define GPS_NORTH_MIN_LAT_GAIN    0.000007
+#define GPS_NORTH_MIN_RELIABLE_MOVE_M 1.5  // with live COG we can trust a shorter GPS hop
 #define GPS_NORTH_SPEED           155
 #define GPS_NORTH_TURN_SPEED      255     // 4WD skid-steer spins stall well below full PWM
 #define MOTOR_PWM_FREQ_HZ         500     // Acebott vehicle library default
@@ -87,14 +109,116 @@ TinyGPSPlus gps;
 bool gpsNorthTestMode = false;
 uint8_t gpsNorthState = 0;
 double gpsNorthStartLat = 0.0;
+double gpsNorthStartLng = 0.0;
+double lastTravelHeading = -1.0;
+bool haveTravelHeading = false;
+double lastMovedM = 0.0;
+double lastHeadingErr = 0.0;
+int lastNorthTurnDir = 0;  // -1 left, +1 right, 0 none
 unsigned long gpsNorthStepMs = 0;
+unsigned long gpsNorthTurnMs = GPS_NORTH_TURN_MS;
 unsigned long gpsNorthFixHeldMs = 0;
 unsigned long lastNorthWaitLogMs = 0;
+bool gpsNorthHadMotion = false;
 uint8_t consecutiveTurns = 0;
 int motorTrim = MOTOR_TRIM_DEFAULT;  // +boosts left / -boosts right
 uint8_t lastMotorDir = 0;
 uint8_t lastMotorLeft = 0;
 uint8_t lastMotorRight = 0;
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+bool lcdReady = false;
+bool lcdHoldBoot = true;  // keep splash until setup() finishes
+uint8_t lcdAddr = OLED_ADDR;
+unsigned long lastLcdMs = 0;
+unsigned long lastLcdRetryMs = 0;
+unsigned long lastLcdPingMs = 0;
+uint32_t lcdInitAttempts = 0;
+uint32_t lcdRecoverCount = 0;
+// ===================== TELEMETRY (Adafruit IO) =====================
+#define TELEMETRY_INTERVAL_MS   10000  // stay under Adafruit IO's free-tier rate limit
+#define WIFI_RETRY_INTERVAL_MS  5000
+WiFiClient telemetryWifiClient;
+Adafruit_MQTT_Client mqtt(&telemetryWifiClient, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+// Single feed with one log-line string per publish - easier to scroll back
+// through as a chronological debug log than correlating several feeds/graphs.
+Adafruit_MQTT_Publish feedLog = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/car-log");
+unsigned long lastWifiAttemptMs = 0;
+unsigned long lastTelemetryMs = 0;
+bool wifiWasConnected = false;
+// Survives software/brownout resets (RTC domain) but clears on true battery
+// disconnect - a rising count with no physical power cycle means reset-looping.
+RTC_DATA_ATTR uint32_t bootCount = 0;
+const char *resetReasonStr = "?";
+const char *describeResetReason(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "OTHER";
+  }
+}
+// 1=POWERON 2=EXT 3=SW 4=PANIC 5=INT_WDT 6=TASK_WDT 7=WDT 8=BROWNOUT 9=other
+int resetReasonCode(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return 1;
+    case ESP_RST_EXT:       return 2;
+    case ESP_RST_SW:        return 3;
+    case ESP_RST_PANIC:     return 4;
+    case ESP_RST_INT_WDT:   return 5;
+    case ESP_RST_TASK_WDT:  return 6;
+    case ESP_RST_WDT:       return 7;
+    case ESP_RST_BROWNOUT:  return 8;
+    default:                return 9;
+  }
+}
+void blinkCount(int n) {
+  for (int i = 0; i < n; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+}
+// LED-only readout so the reset cause is visible even if the OLED never
+// lights up: blink reset-reason code, pause, blink boot count, pause.
+void blinkDiagnostic(int reasonCode, uint32_t boots) {
+  delay(600);
+  blinkCount(reasonCode);
+  delay(1000);
+  blinkCount(boots > 15 ? 15 : (int)boots);
+  delay(1500);
+}
+// If the OLED's power rail rises slower than the ESP32's, the display can be
+// mid-reset while the I2C bus is toggled and leave SDA held low. Bit-bang a
+// clock recovery (up to 9 clocks) so the slave releases SDA before Wire.begin.
+void recoverI2CBus() {
+  pinMode(OLED_SDA_PIN, INPUT_PULLUP);
+  pinMode(OLED_SCL_PIN, OUTPUT);
+  digitalWrite(OLED_SCL_PIN, HIGH);
+  delayMicroseconds(5);
+  if (digitalRead(OLED_SDA_PIN) == HIGH) {
+    return; // bus already idle
+  }
+  lcdRecoverCount++;
+  Serial.println("[OLED] SDA stuck low, clocking bus free");
+  for (int i = 0; i < 9 && digitalRead(OLED_SDA_PIN) == LOW; i++) {
+    digitalWrite(OLED_SCL_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(OLED_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+  }
+  pinMode(OLED_SDA_PIN, OUTPUT);
+  digitalWrite(OLED_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(OLED_SDA_PIN, HIGH);
+  delayMicroseconds(5);
+}
 enum GpsNorthState : uint8_t {
   NORTH_WAIT_FOR_FIX,
   NORTH_DRIVE_FORWARD,
@@ -106,6 +230,8 @@ void handleGpsTest();
 void handleGpsNorthTest();
 void setMotors(uint8_t directionByte, uint8_t leftSpeed, uint8_t rightSpeed);
 void moveStop();
+void lcdInit();
+void handleLcd();
 void moveForward(uint8_t speed = currentSpeed);
 void moveBackward(uint8_t speed = currentSpeed);
 void turnLeft(uint8_t speed = currentSpeed);
@@ -119,13 +245,41 @@ void runStraightBiasTest();
 bool hasFreshGpsFix() {
   return gps.location.isValid() && gps.location.age() < GPS_FIX_MAX_AGE_MS;
 }
-
 uint32_t gpsFixAgeMs() {
   return gps.location.isValid() ? gps.location.age() : 99999;
 }
-
 uint32_t gpsSatCount() {
   return gps.satellites.isValid() ? gps.satellites.value() : 0;
+}
+double wrap180(double deg) {
+  while (deg > 180.0) deg -= 360.0;
+  while (deg < -180.0) deg += 360.0;
+  return deg;
+}
+double headingErrorToNorth(double headingDeg) {
+  return wrap180(headingDeg);
+}
+unsigned long turnDurationForError(double errDeg) {
+  double mag = fabs(errDeg);
+  unsigned long ms = (unsigned long)(mag * GPS_NORTH_TURN_MS_PER_DEG);
+  if (ms < GPS_NORTH_TURN_MIN_MS) ms = GPS_NORTH_TURN_MIN_MS;
+  if (ms > GPS_NORTH_TURN_MAX_MS) ms = GPS_NORTH_TURN_MAX_MS;
+  return ms;
+}
+// Course-over-ground is only trustworthy while the receiver is actually
+// moving. After we stop, TinyGPS keeps the last course as "valid" forever.
+bool sampleMotionHeading(double *headingOut) {
+  if (!gps.course.isValid() || gps.course.age() >= 2000) return false;
+  if (!gps.speed.isValid() || gps.speed.age() >= 2000) return false;
+  if (gps.speed.kmph() < 0.5) return false;
+  if (headingOut) *headingOut = gps.course.deg();
+  return true;
+}
+void updateTravelHeadingWhileMoving() {
+  double heading = 0.0;
+  if (!sampleMotionHeading(&heading)) return;
+  lastTravelHeading = heading;
+  haveTravelHeading = true;
 }
 void gpsInit() {
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -156,11 +310,96 @@ void handleGpsTest() {
                     gps.speed.isValid() ? gps.speed.kmph() : 0.0,
                     gpsCharacterCount);
     } else {
-      Serial.printf("[GPS] %s, no fresh fix | chars: %lu | NMEA lines: %lu\n",
+      Serial.printf("[GPS] %s, no fresh fix | chars: %lu | NMEA lines: %lu | ok %lu | bad %lu\n",
                     gpsDataSeen ? "data detected" : "waiting for data",
                     gpsCharacterCount,
-                    gpsSentenceCount);
+                    gpsSentenceCount,
+                    (unsigned long)gps.passedChecksum(),
+                    (unsigned long)gps.failedChecksum());
     }
+  }
+}
+// ===================== TELEMETRY (Adafruit IO) =====================
+void wifiInit() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWifiAttemptMs = millis();
+  Serial.printf("[WiFi] connecting to %s...\n", WIFI_SSID);
+}
+// Non-blocking: never delay()s the main loop, so a missing hotspot can't
+// stall driving/GPS/OLED. Just keeps retrying in the background.
+void handleWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.printf("[WiFi] CONNECTED | IP: %s | RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+    return;
+  }
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("[WiFi] connection lost");
+  }
+  unsigned long now = millis();
+  if (now - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS) return;
+  lastWifiAttemptMs = now;
+  Serial.println("[WiFi] retrying connection...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+bool mqttConnect() {
+  if (mqtt.connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  int8_t ret = mqtt.connect();
+  if (ret != 0) {
+    Serial.printf("[MQTT] connect failed (%d)\n", ret);
+    mqtt.disconnect();
+    return false;
+  }
+  Serial.println("[MQTT] Adafruit IO connected");
+  return true;
+}
+const char *northStateStr() {
+  switch (gpsNorthState) {
+    case NORTH_WAIT_FOR_FIX:  return "WAIT";
+    case NORTH_DRIVE_FORWARD: return "DRIVE";
+    case NORTH_COMPARE:       return "CHECK";
+    case NORTH_TURN:          return "TURN";
+    default:                  return "?";
+  }
+}
+void handleTelemetry() {
+  unsigned long now = millis();
+  if (now - lastTelemetryMs < TELEMETRY_INTERVAL_MS) return;
+  lastTelemetryMs = now;
+  if (WiFi.status() != WL_CONNECTED || !mqttConnect()) return;
+  const char *mode = gpsNorthTestMode ? "NORTH" : (continuousTestMode ? "LOOP" : "IDLE");
+  char turnCh = (lastNorthTurnDir < 0) ? 'L' : ((lastNorthTurnDir > 0) ? 'R' : '-');
+  char logLine[192];
+  if (gps.location.isValid()) {
+    snprintf(logLine, sizeof(logLine),
+             "t=%lu mode=%s st=%s lat=%.6f lng=%.6f hd=%.1f err=%.0f mv=%.1f sats=%lu nmea=%lu ok=%lu bad=%lu turns=%d dir=%c",
+             millis() / 1000, mode, northStateStr(), gps.location.lat(), gps.location.lng(),
+             lastTravelHeading, lastHeadingErr, lastMovedM, (unsigned long)gpsSatCount(), gpsSentenceCount,
+             (unsigned long)gps.passedChecksum(), (unsigned long)gps.failedChecksum(),
+             consecutiveTurns, turnCh);
+  } else {
+    snprintf(logLine, sizeof(logLine),
+             "t=%lu mode=%s st=%s lat=- lng=- hd=%.1f err=%.0f mv=%.1f sats=%lu nmea=%lu ok=%lu bad=%lu turns=%d dir=%c",
+             millis() / 1000, mode, northStateStr(), lastTravelHeading, lastHeadingErr, lastMovedM,
+             (unsigned long)gpsSatCount(), gpsSentenceCount, (unsigned long)gps.passedChecksum(),
+             (unsigned long)gps.failedChecksum(), consecutiveTurns, turnCh);
+  }
+  feedLog.publish(logLine);
+  Serial.printf("[Telemetry] %s\n", logLine);
+}
+// ===================== LED HELPERS =====================
+void setExternalLeds(bool leftOn) {
+  digitalWrite(LEFT_LED_PIN, leftOn ? HIGH : LOW);
+  digitalWrite(RIGHT_LED_PIN, leftOn ? LOW : HIGH);
+}
+void handleExternalLedFlash() {
   // Both solid = motors commanded on. Fast alternate = GPS bytes seen.
   // Slow alternate = no GPS data yet.
   if (gpsNorthTestMode &&
@@ -170,14 +409,6 @@ void handleGpsTest() {
     digitalWrite(RIGHT_LED_PIN, HIGH);
     return;
   }
-  }
-}
-// ===================== LED HELPERS =====================
-void setExternalLeds(bool leftOn) {
-  digitalWrite(LEFT_LED_PIN, leftOn ? HIGH : LOW);
-  digitalWrite(RIGHT_LED_PIN, leftOn ? LOW : HIGH);
-}
-void handleExternalLedFlash() {
   unsigned long now = millis();
   unsigned long flashIntervalMs = gpsDataSeen ? 150 : 500;
   if (now - lastExternalLedFlashMs >= flashIntervalMs) {
@@ -191,8 +422,123 @@ void delayWithExternalLedFlash(unsigned long durationMs) {
   while (millis() - startMs < durationMs) {
     handleExternalLedFlash();
     handleGpsTest();
+    handleLcd();
     delay(10);
   }
+}
+// ===================== OLED =====================
+void lcdPrintLine(const char *text) {
+  display.println(text != nullptr ? text : "");
+}
+void lcdShowBoot(const char *line2 = nullptr, const char *line3 = nullptr, const char *line4 = nullptr) {
+  if (!lcdReady) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  lcdPrintLine("ACEBOTT BOOT");
+  lcdPrintLine(line2 != nullptr ? line2 : "SSD1306 128x64");
+  lcdPrintLine(line3 != nullptr ? line3 : "GPS North test");
+  lcdPrintLine(line4 != nullptr ? line4 : "starting...");
+  display.display();
+}
+void lcdInit() {
+  // Same sequence that survived battery OFF→ON: Serial delay + motors first,
+  // then Wire + scan so SSD1306 POR finishes before display.begin().
+  lcdInitAttempts++;
+  recoverI2CBus();
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN, 100000);
+  delay(80);
+  Serial.print("[OLED] I2C scan:");
+  uint8_t foundAddr = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", addr);
+      if (addr == 0x3C || addr == 0x3D) foundAddr = addr;
+    }
+  }
+  Serial.println();
+  lcdAddr = foundAddr ? foundAddr : OLED_ADDR;
+  lcdReady = display.begin(SSD1306_SWITCHCAPVCC, lcdAddr);
+  if (!lcdReady) {
+    Serial.println("[OLED] SSD1306 not found. Check 3.3V/GND/SDA21/SCL22.");
+    return;
+  }
+  display.invertDisplay(false);
+  display.dim(false);
+  lcdHoldBoot = true;
+  lcdShowBoot();
+  Serial.printf("[OLED] ready at 0x%02X. GPS lock not required for text.\n", lcdAddr);
+}
+void handleLcd() {
+  unsigned long now = millis();
+  if (!lcdReady) {
+    // Keep trying forever - a power-on glitch shouldn't require a re-flash.
+    if (now - lastLcdRetryMs >= 1000) {
+      lastLcdRetryMs = now;
+      lcdInit();
+    }
+    return;
+  }
+  // Confirm the display still acks; if it silently dropped off the bus,
+  // clear lcdReady so the retry above re-inits it without a power cycle.
+  if (now - lastLcdPingMs >= 2000) {
+    lastLcdPingMs = now;
+    Wire.beginTransmission(lcdAddr);
+    if (Wire.endTransmission() != 0) {
+      Serial.println("[OLED] lost ack, re-initializing");
+      lcdReady = false;
+      return;
+    }
+  }
+  if (lcdHoldBoot) return;
+  if (now - lastLcdMs < LCD_REFRESH_MS) return;
+  lastLcdMs = now;
+  const char *mode = "IDLE";
+  if (gpsNorthTestMode) {
+    switch (gpsNorthState) {
+      case NORTH_WAIT_FOR_FIX:  mode = "HOLD";  break;
+      case NORTH_DRIVE_FORWARD: mode = "DRIVE"; break;
+      case NORTH_COMPARE:       mode = "CHECK"; break;
+      case NORTH_TURN:          mode = "TURN";  break;
+      default:                  mode = "NORTH"; break;
+    }
+  }
+  const char *lock = hasFreshGpsFix() ? "FIX" : (gpsDataSeen ? "NMEA" : "NO");
+  unsigned long ageSec = gpsFixAgeMs() / 1000;
+  if (ageSec > 99) ageSec = 99;
+  double course = gps.course.isValid() ? gps.course.deg() : -1.0;
+  double spd = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+  double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9;
+  char turnCh = (lastNorthTurnDir < 0) ? 'L' : ((lastNorthTurnDir > 0) ? 'R' : '-');
+  char line[22];
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  lcdPrintLine(WiFi.status() == WL_CONNECTED ? "WiFi CONNECTED" : "WiFi connecting");
+  snprintf(line, sizeof(line), "%s s%02lu a%02lus %s",
+           lock, (unsigned long)gpsSatCount(), ageSec, mode);
+  lcdPrintLine(line);
+  snprintf(line, sizeof(line), "ok%lu bad%lu",
+           (unsigned long)gps.passedChecksum(),
+           (unsigned long)gps.failedChecksum());
+  lcdPrintLine(line);
+  if (gps.location.isValid()) {
+    snprintf(line, sizeof(line), "%.5f", gps.location.lat());
+    lcdPrintLine(line);
+    snprintf(line, sizeof(line), "%.5f", gps.location.lng());
+    lcdPrintLine(line);
+  } else {
+    lcdPrintLine("no lat yet");
+    lcdPrintLine("no lng yet");
+  }
+  snprintf(line, sizeof(line), "c%03.0f %4.1fk %c", course, spd, turnCh);
+  lcdPrintLine(line);
+  snprintf(line, sizeof(line), "hd%03.0f hdop%3.1f", lastTravelHeading, hdop);
+  lcdPrintLine(line);
+  display.display();
 }
 // ===================== MOTOR CONTROL =====================
 void writePwmDuty(uint8_t pin, uint8_t val) {
@@ -287,12 +633,13 @@ void stopGpsNorthTest(const char *message) {
   gpsNorthState = NORTH_WAIT_FOR_FIX;
   consecutiveTurns = 0;
   gpsNorthFixHeldMs = 0;
+  gpsNorthHadMotion = false;
+  haveTravelHeading = false;
   moveStop();
 }
 void handleGpsNorthTest() {
   if (!gpsNorthTestMode) return;
   unsigned long now = millis();
-
   switch (gpsNorthState) {
     case NORTH_WAIT_FOR_FIX:
       moveStop();
@@ -310,23 +657,43 @@ void handleGpsNorthTest() {
       }
       if (gpsNorthFixHeldMs == 0) {
         gpsNorthFixHeldMs = now;
+        unsigned long holdMs = gpsNorthHadMotion ? 400 : GPS_NORTH_FIX_HOLD_MS;
         Serial.printf("[North] Fix seen (lat %.6f, sats %lu). Holding %.1f s...\n",
-                      gps.location.lat(), gpsSatCount(), GPS_NORTH_FIX_HOLD_MS / 1000.0);
+                      gps.location.lat(), gpsSatCount(), holdMs / 1000.0);
         return;
       }
-      if (now - gpsNorthFixHeldMs < GPS_NORTH_FIX_HOLD_MS) return;
+      {
+        unsigned long holdMs = gpsNorthHadMotion ? 400 : GPS_NORTH_FIX_HOLD_MS;
+        if (now - gpsNorthFixHeldMs < holdMs) return;
+      }
       gpsNorthStartLat = gps.location.lat();
+      gpsNorthStartLng = gps.location.lng();
       gpsNorthStepMs = now;
-      consecutiveTurns = 0;
       gpsNorthFixHeldMs = 0;
+      haveTravelHeading = false;
+      lastTravelHeading = -1.0;
       gpsNorthState = NORTH_DRIVE_FORWARD;
-      Serial.printf("[North] Baseline lat %.6f. Driving forward for %.1f s\n",
-                    gpsNorthStartLat, GPS_NORTH_DRIVE_MS / 1000.0);
+      Serial.printf("[North] Baseline lat %.6f lng %.6f. Driving forward for %.1f s\n",
+                    gpsNorthStartLat, gpsNorthStartLng, GPS_NORTH_DRIVE_MS / 1000.0);
       moveForward(GPS_NORTH_SPEED);
       break;
-
     case NORTH_DRIVE_FORWARD:
       // Keep driving even if GPS age blips; cheap 1 Hz modules often exceed 2.5 s.
+      // Sample course-over-ground *while moving* — after a stop, speed drops
+      // and TinyGPS keeps a stale course flagged as valid.
+      updateTravelHeadingWhileMoving();
+      gpsNorthHadMotion = true;
+      if (haveTravelHeading && (now - gpsNorthStepMs >= 2500)) {
+        lastHeadingErr = headingErrorToNorth(lastTravelHeading);
+        if (fabs(lastHeadingErr) > GPS_COURSE_TOLERANCE_DEG) {
+          moveStop();
+          gpsNorthStepMs = now;
+          gpsNorthState = NORTH_COMPARE;
+          Serial.printf("[North] Early check: live course %.0f err %.0f\n",
+                        lastTravelHeading, lastHeadingErr);
+          break;
+        }
+      }
       if (now - gpsNorthStepMs >= GPS_NORTH_DRIVE_MS) {
         moveStop();
         gpsNorthStepMs = now;
@@ -334,7 +701,6 @@ void handleGpsNorthTest() {
         Serial.println("[North] Stopped. Settling for GPS update...");
       }
       break;
-
     case NORTH_COMPARE: {
       if (now - gpsNorthStepMs < GPS_NORTH_SETTLE_MS) return;
       if (!hasFreshGpsFix()) {
@@ -346,18 +712,51 @@ void handleGpsNorthTest() {
         return;
       }
       double currentLat = gps.location.lat();
-      double latGain = currentLat - gpsNorthStartLat;
-      bool hasCourse = gps.course.isValid() && gps.speed.kmph() > 0.4;
-      double course = hasCourse ? gps.course.deg() : -1.0;
-      bool goingNorthByLat = (latGain >= GPS_NORTH_MIN_LAT_GAIN);
-      bool goingNorthByCourse = hasCourse &&
-        (course < GPS_COURSE_TOLERANCE_DEG || course > (360.0 - GPS_COURSE_TOLERANCE_DEG));
-      Serial.printf("[North] lat %.6f → %.6f (gain %.6f) | course %.1f° | sats %lu\n",
-                    gpsNorthStartLat, currentLat, latGain, course, gpsSatCount());
-      if (goingNorthByLat || goingNorthByCourse) {
+      double currentLng = gps.location.lng();
+      double movedM = TinyGPSPlus::distanceBetween(
+          gpsNorthStartLat, gpsNorthStartLng, currentLat, currentLng);
+      lastMovedM = movedM;
+      double heading = 0.0;
+      const char *src = "-";
+      bool haveReliableHeading = false;
+      // Prefer Doppler course captured while the wheels were rolling. Start/stop
+      // displacement on a cheap GPS is often only 1-3 m of noise, which used to
+      // look like "no heading" and made the car keep driving the same way.
+      if (haveTravelHeading) {
+        heading = lastTravelHeading;
+        haveReliableHeading = true;
+        src = "cog";
+      } else if (movedM >= GPS_NORTH_MIN_RELIABLE_MOVE_M) {
+        heading = TinyGPSPlus::courseTo(
+            gpsNorthStartLat, gpsNorthStartLng, currentLat, currentLng);
+        lastTravelHeading = heading;
+        haveTravelHeading = true;
+        haveReliableHeading = true;
+        src = "disp";
+      } else if (sampleMotionHeading(&heading)) {
+        lastTravelHeading = heading;
+        haveTravelHeading = true;
+        haveReliableHeading = true;
+        src = "live";
+      }
+      if (!haveReliableHeading) {
+        Serial.printf("[North] no heading yet (move %.1fm). Driving on to sample course\n", movedM);
+        gpsNorthStepMs = now;
+        gpsNorthState = NORTH_DRIVE_FORWARD;
+        moveForward(GPS_NORTH_SPEED);
+        break;
+      }
+      double err = headingErrorToNorth(heading);
+      lastHeadingErr = err;
+      bool goingNorth = fabs(err) <= GPS_COURSE_TOLERANCE_DEG;
+      Serial.printf("[North] src %s move %.1fm hd %.0f err %.0f sats %lu\n",
+                    src, movedM, heading, err, gpsSatCount());
+      if (goingNorth) {
         gpsNorthStartLat = currentLat;
+        gpsNorthStartLng = currentLng;
         gpsNorthStepMs = now;
         consecutiveTurns = 0;
+        lastNorthTurnDir = 0;
         gpsNorthState = NORTH_DRIVE_FORWARD;
         Serial.println("[North] Heading looks good → continue forward");
         moveForward(GPS_NORTH_SPEED);
@@ -367,19 +766,32 @@ void handleGpsNorthTest() {
           return;
         }
         consecutiveTurns++;
+        gpsNorthTurnMs = turnDurationForError(err);
         gpsNorthStepMs = now;
         gpsNorthState = NORTH_TURN;
-        Serial.printf("[North] Not north enough (turn %d/%d). Spinning right @ %d...\n",
-                      consecutiveTurns, GPS_MAX_CONSECUTIVE_TURNS, GPS_NORTH_TURN_SPEED);
-        turnRight(GPS_NORTH_TURN_SPEED);   // change to turnLeft() if your mapping is inverted
+        // err > 0 means course is east of north (clockwise) - turn LEFT
+        // (counter-clockwise) to reduce it back to 0; err < 0 (west of
+        // north) needs a RIGHT turn.
+        if (err > 0.0) {
+          lastNorthTurnDir = -1;
+          Serial.printf("[North] Heading %.0f, need left %.0f deg for %lu ms (turn %d/%d)\n",
+                        heading, err, gpsNorthTurnMs, consecutiveTurns, GPS_MAX_CONSECUTIVE_TURNS);
+          turnLeft(GPS_NORTH_TURN_SPEED);
+        } else {
+          lastNorthTurnDir = 1;
+          Serial.printf("[North] Heading %.0f, need right %.0f deg for %lu ms (turn %d/%d)\n",
+                        heading, -err, gpsNorthTurnMs, consecutiveTurns, GPS_MAX_CONSECUTIVE_TURNS);
+          turnRight(GPS_NORTH_TURN_SPEED);
+        }
       }
       break;
     }
-
     case NORTH_TURN:
-      if (now - gpsNorthStepMs >= GPS_NORTH_TURN_MS) {
+      if (now - gpsNorthStepMs >= gpsNorthTurnMs) {
         moveStop();
         gpsNorthFixHeldMs = 0;
+        haveTravelHeading = false;
+        lastTravelHeading = -1.0;
         gpsNorthState = NORTH_WAIT_FOR_FIX;   // force new baseline after turn
         Serial.println("[North] Turn finished. Taking new baseline.");
       }
@@ -443,6 +855,8 @@ void printHelpMenu() {
   Serial.printf("  Current Speed: %d / 255 | Trim: %d\n", currentSpeed, motorTrim);
   Serial.println("=========================================");
   Serial.println("External LEDs: slow = no GPS data, fast = GPS bytes seen, both solid = driving");
+  Serial.println("OLED: SSD1306 128x64 I2C 0x3C on SDA=21 SCL=22. Power 3.3V only.");
+  Serial.println("OLED: FIX/NMEA, sats, age, mode, lat/lng, course, L/R turn, travel heading");
   Serial.println("Auto GPS-North test starts on boot (outdoors recommended)");
   Serial.println("Commands:");
   Serial.println("  w / s / a / d   = Forward / Backward / Spin Left / Spin Right");
@@ -584,14 +998,30 @@ void handleContinuousTest() {
 }
 // ===================== SETUP & LOOP =====================
 void setup() {
+  // A marginal battery/regulator can sag enough to trip the ESP32's brownout
+  // detector during boot, causing a silent reset loop before setup() ever
+  // finishes. Disable it here so we at least get a chance to run and report.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  bootCount++;
+  resetReasonStr = describeResetReason(esp_reset_reason());
   Serial.begin(115200);
   delay(400);
+  Serial.printf("[OLED] boot #%lu reason=%s\n", (unsigned long)bootCount, resetReasonStr);
+  pinMode(LED_PIN, OUTPUT);
+  // Report reason-code blinks then boot-count blinks so the cause is
+  // readable purely from the LED if the screen stays blank.
+  blinkDiagnostic(resetReasonCode(esp_reset_reason()), bootCount);
   motorInit();
+  lcdInit();
   gpsInit();
+  wifiInit();
   printHelpMenu();
   Serial.println("Place robot outdoors with clear sky view.");
   Serial.println("Auto GPS-North test will arm in 3 seconds (waits for fix before moving).\n");
   for (int i = 3; i > 0; i--) {
+    char countLine[22];
+    snprintf(countLine, sizeof(countLine), "starting in %d...", i);
+    lcdShowBoot("SSD1306 128x64", "GPS North test", countLine);
     Serial.printf("Starting in %d...\n", i);
     digitalWrite(LED_PIN, HIGH);
     delayWithExternalLedFlash(450);
@@ -603,8 +1033,11 @@ void setup() {
     gpsNorthState = NORTH_WAIT_FOR_FIX;
     consecutiveTurns = 0;
     moveStop();
+    lcdShowBoot("SSD1306 128x64", "North test armed", "waiting for GPS");
     Serial.println("[North] Auto GPS-North test armed. Waiting for fresh fix...");
   }
+  lcdHoldBoot = false;
+  lastLcdMs = 0;
   printHelpMenu();
 }
 void loop() {
@@ -612,8 +1045,10 @@ void loop() {
   handleContinuousTest();
   handleExternalLedFlash();
   handleGpsTest();
+  handleLcd();
   handleGpsNorthTest();
-  // Heartbeat
+  handleWifi();
+  handleTelemetry();
   static unsigned long lastBlinkMs = 0;
   if (millis() - lastBlinkMs >= 1000) {
     lastBlinkMs = millis();
